@@ -1,130 +1,109 @@
 import os
 import time
 import datetime
+from ping3 import ping
 import re
 
-def current_date_and_time():
-    return datetime.datetime.now().strftime('%d-%m-%Y_%H_%M_%S')
 
-def parse_mtr_report(file_path, target_ips):
-    reports = {}
-    current_ip = None
-    
-    with open(file_path, 'r') as f:
-        for line in f:
-            # Определяем начало нового теста по целевому IP
-            ip_match = re.match(r'Test IP: (\d+\.\d+\.\d+\.\d+)', line)
-            if ip_match:
-                current_ip = ip_match.group(1)
-                if current_ip in target_ips:
-                    reports[current_ip] = {
-                        'hops': [],
-                        'total_stdev': 0.0,
-                        'avg_total': 0.0,
-                        'hop_count': 0
-                    }
+# Получаем текущую дату и время
+def current_date_and_time():
+    return datetime.datetime.now().strftime('%d-%m-%Y_%H:%M:%S')
+
+
+# Нахождение медианы списка чисел
+def find_median(lst):
+    if not lst:
+        return None
+    sorted_list = sorted(lst)
+    n = len(sorted_list)
+    mid = n // 2
+    return sorted_list[mid] if n % 2 != 0 else (sorted_list[mid - 1] + sorted_list[mid]) / 2
+
+
+# Функция парсинга отчета MTR
+def parse_mtr_report(file_path):
+    reports = {}  # Словарь для хранения отчетов по каждому IP
+    current_ip = None  # Текущий обрабатываемый IP адрес
+
+    with open(file_path, 'r') as file:
+        for line in file:
+            # Поиск строки с тестовым IP
+            match_ip = re.search(r'^Test IP:\s+([\d\.]+)$', line)
+            if match_ip:
+                current_ip = match_ip.group(1)
+                reports[current_ip] = {'hops': [], 'total_loss': 0, 'total_avg_delay': 0, 'total_std_dev': 0}
                 continue
-            
-            # Парсим данные по хопам только для целевых IP
-            if current_ip in target_ips and reports.get(current_ip):
-                hop_match = re.match(
-                    r'\s*\d+\..*?(\d+\.\d+)%\s+\d+\s+'
-                    r'(\d+\.\d+)\s+(\d+\.\d+)\s+'
-                    r'(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)', 
-                    line
-                )
+
+            # Обработка строк с результатами каждого хопа
+            match_hop = re.search(r'\s*(\d+)\..*?\s+(\d+\.\d+)%\s+\d+\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)', line)
+            if match_hop and current_ip:
+                _, loss_percent, min_delay, avg_delay, max_delay, std_dev = map(float, match_hop.groups())
                 
-                if hop_match:
-                    loss = float(hop_match.group(1))
-                    avg = float(hop_match.group(3))
-                    stdev = float(hop_match.group(6))
-                    
-                    if loss < 100.0:
-                        reports[current_ip]['hops'].append({
-                            'avg': avg,
-                            'stdev': stdev
-                        })
-                        reports[current_ip]['total_stdev'] += stdev
-                        reports[current_ip]['avg_total'] += avg
-                        reports[current_ip]['hop_count'] += 1
-    
-    # Рассчитываем средние значения
+                # Добавляем данные только если потери пакетов менее 100%
+                if loss_percent < 100.0:
+                    reports[current_ip]['hops'].append({'loss': loss_percent, 'avg_delay': avg_delay, 'std_dev': std_dev})
+                    reports[current_ip]['total_loss'] += loss_percent
+                    reports[current_ip]['total_avg_delay'] += avg_delay
+                    reports[current_ip]['total_std_dev'] += std_dev
+
+    # Вычисление средних значений
     for ip in reports:
-        if reports[ip]['hop_count'] > 0:
-            reports[ip]['avg_total'] /= reports[ip]['hop_count']
+        num_hops = len(reports[ip]['hops'])
+        if num_hops > 0:
+            reports[ip]['avg_loss'] = reports[ip]['total_loss'] / num_hops
+            reports[ip]['avg_delay'] = reports[ip]['total_avg_delay'] / num_hops
+            reports[ip]['avg_std_dev'] = reports[ip]['total_std_dev'] / num_hops
     
     return reports
 
+
+# Выбор наилучших IP-адресов
 def select_best_ips(reports):
     return sorted(
-        reports.items(),
-        key=lambda x: (
-            x[1]['hop_count'], 
-            x[1]['total_stdev'],
-            x[1]['avg_total']
-        )
+        reports.items(), 
+        key=lambda item: (
+            item[1].get('avg_delay'),       # Основной приоритет - минимальная задержка
+            item[1].get('avg_std_dev'),     # Второстепенно - минимальное отклонение задержки
+            item[1].get('avg_loss'),        # Третий приоритет - минимальные потери пакетов
+            len(item[1].get('hops'))        # Четвертый приоритет - наименьшее кол-во хопов
+        ),
+        reverse=False
     )
 
-def main():
-    start_time = time.time()
-    timestamp = current_date_and_time()
-    log_file = f"mtr_report_{timestamp}.log"
-    temp_file = "mtr_temp.txt"
-    
-    try:
-        # Чтение IP-адресов
-        with open('hosts.txt', 'r') as f:
-            ips = [line.strip() for line in f if line.strip()]
-        
-        if not ips:
-            raise ValueError("Файл hosts.txt пуст!")
-        
-        # Запись заголовка в лог-файл
-        with open(log_file, 'w') as f:
-            f.write(f"MTR Report {timestamp}\n{'='*40}\n")
-        
-        # Запуск mtr для всех IP
-        for ip in ips:
-            print(f"Тестируем {ip} с помощью mtr...")
-            
-            with open(temp_file, 'a') as f:
-                f.write(f"\nTest IP: {ip}\n")
-            
-            os.system(f'mtr -r -c 5 --report {ip} >> {temp_file}')
-            time.sleep(1)
-        
-        # Анализ результатов
-        reports = parse_mtr_report(temp_file, ips)
-        sorted_ips = select_best_ips(reports)
-        
-        # Запись результатов в лог
-        with open(log_file, 'a') as f:
-            f.write("\nРейтинг кандидатов:\n")
-            f.write("{:<15} {:<6} {:<8} {:<12}\n".format(
-                "IP", "Хопы", "StDev", "Ср.Задержка"
-            ))
-            f.write("-"*45 + "\n")
-            for ip, data in sorted_ips:
-                f.write(f"{ip:<15} {data['hop_count']:<6} "
-                      f"{data['total_stdev']:<8.1f} "
-                      f"{data['avg_total']:<12.1f} ms\n")
-        
-        # Вывод результатов в консоль
-        print("\n" + "="*50)
-        print(f"Полный отчет сохранен в файл: {log_file}")
-        print("Топ кандидатов:")
-        for ip, data in sorted_ips[:3]:
-            print(f"{ip}: {data['avg_total']:.1f} ms (hops: {data['hop_count']})")
-        
-        print(f"\nОбщее время выполнения: {time.time()-start_time:.1f} сек.")
-        
-    except Exception as e:
-        print(f"Ошибка: {e}")
-    finally:
-        # Удаление временного файла
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
-            print(f"\nВременный файл {temp_file} удален")
 
+# Точка входа программы
 if __name__ == "__main__":
-    main()
+    start_time = time.time()
+    print(f"Сбор статистики начат: {current_date_and_time()}...\n")
+
+    try:
+        # Читаем список IP-адресов из файла hosts.txt
+        with open('hosts.txt', 'r') as host_file:
+            candidate_ips = [line.strip() for line in host_file.readlines() if line.strip()]
+        
+        if not candidate_ips:
+            raise ValueError("Файл hosts.txt пуст!")
+
+        # Выполняем тестирование всех IP через команду mtr
+        results_file = 'mtr_reports.txt'
+        open(results_file, 'w').close()  # Создаем пустой файл для записей
+
+        for ip in candidate_ips:
+            print(f"Провожу проверку {ip}...")
+            os.system(f'mtr -rw -c 5 {ip} >> {results_file}')
+            time.sleep(2)
+
+        # Парсим отчеты
+        parsed_data = parse_mtr_report(results_file)
+        best_candidates = select_best_ips(parsed_data)
+
+        # Выводим рейтинг выбранных серверов
+        print("\nОтчет по результатам проверки:")
+        print("IP Адрес\t\tСредн.Delay(ms)\tStd Dev(ms)\tПотеря Пакетов(%)\tХопы")
+        for ip, report in best_candidates:
+            print(f"{ip}\t\t{report.get('avg_delay', '-'):7.2f}\t{report.get('avg_std_dev', '-'):8.2f}\t{report.get('avg_loss', '-'):11.2f}%\t{len(report.get('hops', []))}")
+
+        print(f"\nТестирование завершилось успешно! Время исполнения: {time.time() - start_time:.1f} секунд.")
+
+    except Exception as err:
+        print(f"Возникла ошибка: {err}")
