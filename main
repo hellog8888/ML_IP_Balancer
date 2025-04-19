@@ -1,114 +1,130 @@
 import os
 import time
 import datetime
-from ping3 import ping
-import requests
-
+import re
 
 def current_date_and_time():
-    cur_time = datetime.datetime.now()
-    return f'{cur_time.day}-{cur_time.month:02}-{cur_time.year}_{cur_time.hour:02}_{cur_time.minute:02}_{cur_time.second:02}'
+    return datetime.datetime.now().strftime('%d-%m-%Y_%H_%M_%S')
 
+def parse_mtr_report(file_path, target_ips):
+    reports = {}
+    current_ip = None
+    
+    with open(file_path, 'r') as f:
+        for line in f:
+            # Определяем начало нового теста по целевому IP
+            ip_match = re.match(r'Test IP: (\d+\.\d+\.\d+\.\d+)', line)
+            if ip_match:
+                current_ip = ip_match.group(1)
+                if current_ip in target_ips:
+                    reports[current_ip] = {
+                        'hops': [],
+                        'total_stdev': 0.0,
+                        'avg_total': 0.0,
+                        'hop_count': 0
+                    }
+                continue
+            
+            # Парсим данные по хопам только для целевых IP
+            if current_ip in target_ips and reports.get(current_ip):
+                hop_match = re.match(
+                    r'\s*\d+\..*?(\d+\.\d+)%\s+\d+\s+'
+                    r'(\d+\.\d+)\s+(\d+\.\d+)\s+'
+                    r'(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)', 
+                    line
+                )
+                
+                if hop_match:
+                    loss = float(hop_match.group(1))
+                    avg = float(hop_match.group(3))
+                    stdev = float(hop_match.group(6))
+                    
+                    if loss < 100.0:
+                        reports[current_ip]['hops'].append({
+                            'avg': avg,
+                            'stdev': stdev
+                        })
+                        reports[current_ip]['total_stdev'] += stdev
+                        reports[current_ip]['avg_total'] += avg
+                        reports[current_ip]['hop_count'] += 1
+    
+    # Рассчитываем средние значения
+    for ip in reports:
+        if reports[ip]['hop_count'] > 0:
+            reports[ip]['avg_total'] /= reports[ip]['hop_count']
+    
+    return reports
 
-def find_median(lst):
-    if not lst:
-        return None
-    sorted_list = sorted(lst)
-    mid_idx = (len(sorted_list) - 1) // 2
-    return (sorted_list[mid_idx] + sorted_list[mid_idx + 1]) / 2.0 if len(sorted_list) % 2 == 0 else sorted_list[
-        mid_idx]
+def select_best_ips(reports):
+    return sorted(
+        reports.items(),
+        key=lambda x: (
+            x[1]['hop_count'], 
+            x[1]['total_stdev'],
+            x[1]['avg_total']
+        )
+    )
 
-
-def get_lst_from_file(file_txt):
+def main():
+    start_time = time.time()
+    timestamp = current_date_and_time()
+    log_file = f"mtr_report_{timestamp}.log"
+    temp_file = "mtr_temp.txt"
+    
     try:
-        with open(file_txt, 'r') as file_txt_r:
-            return [line.rstrip('\n') for line in file_txt_r]
-    except FileNotFoundError:
-        print(f"Файл {file_txt} не найден!")
-        return []
-
-# not use
-def get_country_by_ip(ip_address):
-    try:
-        response = requests.get(f"https://ipinfo.io/{ip_address}/json", timeout=5)
-        data = response.json()
-        return f"{data.get('city', 'Unknown')}/{data.get('region', 'Unknown')}/{data.get('country', 'Unknown')}"
-    except Exception as e:
-        print(f"Ошибка при запросе локации: {e}")
-        return "Unknown"
-
-# not use
-def create_ip_country_dict(ip_list):
-    ip_country = {}
-    for ip in ip_list:
-        if ip not in ip_country:
-            ip_country[ip] = get_country_by_ip(ip)
+        # Чтение IP-адресов
+        with open('hosts.txt', 'r') as f:
+            ips = [line.strip() for line in f if line.strip()]
+        
+        if not ips:
+            raise ValueError("Файл hosts.txt пуст!")
+        
+        # Запись заголовка в лог-файл
+        with open(log_file, 'w') as f:
+            f.write(f"MTR Report {timestamp}\n{'='*40}\n")
+        
+        # Запуск mtr для всех IP
+        for ip in ips:
+            print(f"Тестируем {ip} с помощью mtr...")
+            
+            with open(temp_file, 'a') as f:
+                f.write(f"\nTest IP: {ip}\n")
+            
+            os.system(f'mtr -r -c 5 --report {ip} >> {temp_file}')
             time.sleep(1)
-    return ip_country
-
-
-def ping_check(hosts, attempts=2):
-    results = {}
-    failed = []
-
-    for idx, ip in enumerate(hosts, 1):
-        print(f"Проверка {ip} [{idx}/{len(hosts)}]")
-        delays = []
-
-        for _ in range(attempts):
-            try:
-                delay = ping(ip, timeout=1, unit='ms')
-                if delay is not None:
-                    delays.append(delay)
-            except Exception as e:
-                print(f"Ошибка ping: {e}")
-
-        if len(delays) >= attempts // 2:
-            results[ip] = find_median(delays)
-        else:
-            failed.append(ip)
-
-    return dict(sorted(results.items(), key=lambda x: x[1])), failed
-
-
+        
+        # Анализ результатов
+        reports = parse_mtr_report(temp_file, ips)
+        sorted_ips = select_best_ips(reports)
+        
+        # Запись результатов в лог
+        with open(log_file, 'a') as f:
+            f.write("\nРейтинг кандидатов:\n")
+            f.write("{:<15} {:<6} {:<8} {:<12}\n".format(
+                "IP", "Хопы", "StDev", "Ср.Задержка"
+            ))
+            f.write("-"*45 + "\n")
+            for ip, data in sorted_ips:
+                f.write(f"{ip:<15} {data['hop_count']:<6} "
+                      f"{data['total_stdev']:<8.1f} "
+                      f"{data['avg_total']:<12.1f} ms\n")
+        
+        # Вывод результатов в консоль
+        print("\n" + "="*50)
+        print(f"Полный отчет сохранен в файл: {log_file}")
+        print("Топ кандидатов:")
+        for ip, data in sorted_ips[:3]:
+            print(f"{ip}: {data['avg_total']:.1f} ms (hops: {data['hop_count']})")
+        
+        print(f"\nОбщее время выполнения: {time.time()-start_time:.1f} сек.")
+        
+    except Exception as e:
+        print(f"Ошибка: {e}")
+    finally:
+        # Удаление временного файла
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+            print(f"\nВременный файл {temp_file} удален")
 
 if __name__ == "__main__":
-    # Инициализация
-    start_time = time.time()
-    print(f"\nСтарт тестирования: {current_date_and_time()}\n")
-
-    # Конфигурация
-    PING_ATTEMPTS = 2
-    HOSTS_FILE = "hosts.txt"
-
-    try:
-        # Этап 1: Загрузка хостов
-        print("1. Загрузка IP-адресов")
-        ip_list = get_lst_from_file(HOSTS_FILE)
-        if not ip_list:
-            raise ValueError("Список IP-адресов пуст!")
-
-        # Этап 2: Проверка доступности
-        print("\n2. Проверка доступности")
-        working_ips, failed_ips = ping_check(ip_list, PING_ATTEMPTS)
-
-        print(f"\nУспешные соединения: {len(working_ips)}")
-        print("Топ-3 быстрых IP:")
-        for ip, latency in list(working_ips.items())[:3]:
-            print(f"  {ip}: {latency:.2f} мс")
-
-        # Этап 3: Обновление конфигурации
-        if working_ips:
-            # os.system("xkeen -stop")
-            for best_ip in list(working_ips)[:3]:
-                print(f"\n3. Обновление конфигурации {best_ip}")
-                time.sleep(1)
-                os.system(f'echo -e "\\nТестируем IP: {best_ip}" >> mtrfile.txt && mtr -r -c 5 {best_ip} >> mtrfile.txt')
-                time.sleep(5)
-
-        # Отчет
-        print(f"\nОбщее время выполнения: {time.time() - start_time:.2f} сек.")
-
-    except Exception as e:
-        print(f"\nКритическая ошибка: {e}")
-        exit(1)
+    main()
