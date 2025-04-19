@@ -1,0 +1,125 @@
+import os
+import time
+import datetime
+from ping3 import ping
+import requests
+
+
+# --------------------------
+# Общие утилиты (func.py)
+# --------------------------
+def current_date_and_time():
+    cur_time = datetime.datetime.now()
+    return f'{cur_time.day}-{cur_time.month:02}-{cur_time.year}_{cur_time.hour:02}_{cur_time.minute:02}_{cur_time.second:02}'
+
+
+def find_median(lst):
+    if not lst:
+        return None
+    sorted_list = sorted(lst)
+    mid_idx = (len(sorted_list) - 1) // 2
+    return (sorted_list[mid_idx] + sorted_list[mid_idx + 1]) / 2.0 if len(sorted_list) % 2 == 0 else sorted_list[
+        mid_idx]
+
+
+def get_lst_from_file(file_txt):
+    try:
+        with open(file_txt, 'r') as file_txt_r:
+            return [line.rstrip('\n') for line in file_txt_r]
+    except FileNotFoundError:
+        print(f"Файл {file_txt} не найден!")
+        return []
+
+
+# --------------------------
+# Локация IP (func_ip_location.py)
+# --------------------------
+def get_country_by_ip(ip_address):
+    try:
+        response = requests.get(f"https://ipinfo.io/{ip_address}/json", timeout=5)
+        data = response.json()
+        return f"{data.get('city', 'Unknown')}/{data.get('region', 'Unknown')}/{data.get('country', 'Unknown')}"
+    except Exception as e:
+        print(f"Ошибка при запросе локации: {e}")
+        return "Unknown"
+
+
+def create_ip_country_dict(ip_list):
+    ip_country = {}
+    for ip in ip_list:
+        if ip not in ip_country:
+            ip_country[ip] = get_country_by_ip(ip)
+            time.sleep(1)
+    return ip_country
+
+
+# --------------------------
+# Проверка Ping (func_ip_test.py)
+# --------------------------
+def ping_check(hosts, attempts=2):
+    results = {}
+    failed = []
+
+    for idx, ip in enumerate(hosts, 1):
+        print(f"Проверка {ip} [{idx}/{len(hosts)}]")
+        delays = []
+
+        for _ in range(attempts):
+            try:
+                delay = ping(ip, timeout=1, unit='ms')
+                if delay is not None:
+                    delays.append(delay)
+            except Exception as e:
+                print(f"Ошибка ping: {e}")
+
+        if len(delays) >= attempts // 2:
+            results[ip] = find_median(delays)
+        else:
+            failed.append(ip)
+
+    return dict(sorted(results.items(), key=lambda x: x[1])), failed
+
+
+# --------------------------
+# Основной скрипт
+# --------------------------
+if __name__ == "__main__":
+    # Инициализация
+    start_time = time.time()
+    print(f"\nСтарт тестирования: {current_date_and_time()}\n")
+
+    # Конфигурация
+    PING_ATTEMPTS = 2
+    HOSTS_FILE = "hosts.txt"
+
+    try:
+        # Этап 1: Загрузка хостов
+        print("1. Загрузка IP-адресов")
+        ip_list = get_lst_from_file(HOSTS_FILE)
+        if not ip_list:
+            raise ValueError("Список IP-адресов пуст!")
+
+        # Этап 2: Проверка доступности
+        print("\n2. Проверка доступности")
+        working_ips, failed_ips = ping_check(ip_list, PING_ATTEMPTS)
+
+        print(f"\nУспешные соединения: {len(working_ips)}")
+        print("Топ-3 быстрых IP:")
+        for ip, latency in list(working_ips.items())[:3]:
+            print(f"  {ip}: {latency:.2f} мс")
+
+        # Этап 3: Обновление конфигурации
+        if working_ips:
+            os.system("xkeen -stop")
+            for best_ip in list(working_ips)[:3]:
+                print(f"\n3. Обновление конфигурации {best_ip}")
+                time.sleep(1)
+                os.system(f"mtr -r -c 10 {best_ip}")
+                time.sleep(10)
+
+        # Отчет
+        print(f"\nОбщее время выполнения: {time.time() - start_time:.2f} сек.")
+
+    except Exception as e:
+        print(f"\nКритическая ошибка: {e}")
+        exit(1)
