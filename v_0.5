@@ -1,0 +1,118 @@
+import os
+import time
+import datetime
+import re
+
+def current_date_and_time():
+    return datetime.datetime.now().strftime('%d-%m-%Y_%H_%M_%S')
+
+def parse_mtr_report(file_path, target_ips):
+    reports = {}
+    current_ip = None
+    
+    with open(file_path, 'r') as f:
+        for line in f:
+            ip_match = re.match(r'Test IP: (\d+\.\d+\.\d+\.\d+)', line)
+            if ip_match:
+                current_ip = ip_match.group(1)
+                if current_ip in target_ips:
+                    reports[current_ip] = {
+                        'hops': [],
+                        'total_stdev': 0.0,
+                        'avg_total': 0.0,
+                        'hop_count': 0
+                    }
+                continue
+            
+            if current_ip in target_ips and reports.get(current_ip):
+                hop_match = re.match(
+                    r'\s*\d+\..*?(\d+\.\d+)%\s+\d+\s+'
+                    r'(\d+\.\d+)\s+(\d+\.\d+)\s+'
+                    r'(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)', 
+                    line
+                )
+                
+                if hop_match:
+                    loss = float(hop_match.group(1))
+                    avg = float(hop_match.group(3))
+                    stdev = float(hop_match.group(6))
+                    
+                    if loss < 100.0:
+                        reports[current_ip]['hops'].append({
+                            'avg': avg,
+                            'stdev': stdev
+                        })
+                        reports[current_ip]['total_stdev'] += stdev
+                        reports[current_ip]['avg_total'] += avg
+                        reports[current_ip]['hop_count'] += 1
+    
+    for ip in reports:
+        if reports[ip]['hop_count'] > 0:
+            reports[ip]['avg_total'] /= reports[ip]['hop_count']
+    
+    return reports
+
+def select_best_ips(reports):
+    return sorted(
+        reports.items(),
+        key=lambda x: (
+            x[1]['total_stdev'],    # Основной критерий
+            x[1]['avg_total'],	    # Вторичный критерий
+	    x[1]['hop_count']       # Третичный критерий
+        )
+    )
+
+def main():
+    start_time = time.time()
+    timestamp = current_date_and_time()
+    log_file = f"mtr_report_{timestamp}.log"
+    temp_file = "mtr_temp.txt"
+    
+    try:
+        with open('hosts.txt', 'r') as f:
+            ips = [line.strip() for line in f if line.strip()]
+        
+        if not ips:
+            raise ValueError("Файл hosts.txt пуст!")
+        
+        with open(log_file, 'w') as f:
+            f.write(f"MTR Report {timestamp}\n{'='*40}\n")
+        
+        for ip in ips:
+            print(f"Тестируем {ip} с помощью mtr...")
+            with open(temp_file, 'a') as f:
+                f.write(f"\nTest IP: {ip}\n")
+            os.system(f'mtr -r -c 50 --report {ip} >> {temp_file}')
+            time.sleep(10)
+        
+        reports = parse_mtr_report(temp_file, ips)
+        sorted_ips = select_best_ips(reports)
+        
+        with open(log_file, 'a') as f:
+            f.write("\nРейтинг кандидатов (по приоритету: StDev → Хопы → Задержка):\n")
+            f.write("{:<15} {:<6} {:<8} {:<12}\n".format(
+                "IP", "Хопы", "StDev", "Ср.Задержка"
+            ))
+            f.write("-"*45 + "\n")
+            for ip, data in sorted_ips:
+                f.write(f"{ip:<15} {data['hop_count']:<6} "
+                      f"{data['total_stdev']:<8.1f} "
+                      f"{data['avg_total']:<12.1f} ms\n")
+        
+        print("\n" + "="*50)
+        print(f"Полный отчет сохранен в файл: {log_file}")
+        print("Топ кандидатов (по StDev → Хопы → Задержке):")
+        for ip, data in sorted_ips[:3]:
+            print(f"{ip}: StDev={data['total_stdev']:.1f}, Хопы={data['hop_count']}, Задержка={data['avg_total']:.1f} ms")
+        
+        print(f"\nОбщее время выполнения: {time.time()-start_time:.1f} сек.")
+        
+    except Exception as e:
+        print(f"Ошибка: {e}")
+    finally:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+            print(f"\nВременный файл {temp_file} удален")
+
+if __name__ == "__main__":
+    main()
